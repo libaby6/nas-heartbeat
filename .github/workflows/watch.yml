@@ -1,0 +1,48 @@
+name: nas-heartbeat-watch
+
+on:
+  schedule:
+    # GitHub 的定时最小粒度是 5 分钟，且高峰期可能排队延迟
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nas-heartbeat-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 巡检心跳
+        env:
+          GIST_ID: ${{ vars.GIST_ID }}
+          GH_PAT: ${{ secrets.GH_PAT }}
+          SMTP_HOST: smtp.qq.com
+          SMTP_PORT: "465"
+          SMTP_USER: ${{ vars.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ vars.MAIL_TO }}
+          OFFLINE_AFTER_MIN: ${{ vars.OFFLINE_AFTER_MIN }}
+          COOLDOWN_MIN: ${{ vars.COOLDOWN_MIN }}
+        run: python3 watch.py
+
+      # GitHub 会在仓库连续 60 天无提交后自动停用定时任务。
+      # 这里每天写一次日期，制造一次提交来保活（同一天不会重复提交）。
+      - name: 保活
+        if: github.event_name == 'schedule'
+        run: |
+          date -u +"%Y-%m-%d" > keepalive.txt
+          if ! git diff --quiet -- keepalive.txt; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add keepalive.txt
+            git commit -m "keepalive $(date -u +%F)"
+            git push
+          fi
