@@ -23,6 +23,7 @@ jobs:
       - name: 巡检心跳
         env:
           GIST_ID: ${{ vars.GIST_ID }}
+          STATE_GIST_ID: ${{ vars.STATE_GIST_ID }}
           GH_PAT: ${{ secrets.GH_PAT }}
           SMTP_HOST: smtp.qq.com
           SMTP_PORT: "465"
