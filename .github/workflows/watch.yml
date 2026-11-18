@@ -31,6 +31,7 @@ jobs:
           MAIL_TO: ${{ vars.MAIL_TO }}
           OFFLINE_AFTER_MIN: ${{ vars.OFFLINE_AFTER_MIN }}
           COOLDOWN_MIN: ${{ vars.COOLDOWN_MIN }}
+          MAX_ALERTS_PER_INCIDENT: ${{ vars.MAX_ALERTS_PER_INCIDENT }}
         run: python3 watch.py
 
       # GitHub 会在仓库连续 60 天无提交后自动停用定时任务。
