@@ -41,7 +41,9 @@ MAIL_FROM = envs("MAIL_FROM") or SMTP_USER
 MAIL_TO = [x.strip() for x in envs("MAIL_TO").split(",") if x.strip()]
 
 OFFLINE_MIN = envf("OFFLINE_AFTER_MIN", 15)
-COOLDOWN_MIN = envf("COOLDOWN_MIN", 120)
+COOLDOWN_MIN = envf("COOLDOWN_MIN", 30)
+# 同一次故障最多发几封告警；发满后就闭嘴，等恢复时再通知一次
+MAX_ALERTS = max(1, int(envf("MAX_ALERTS_PER_INCIDENT", 2)))
 NEVER_MIN = envf("NEVER_HEARTBEAT_MIN", 180)
 LOSS_ALERT_PCT = envf("LOSS_ALERT_PCT", 40)
 DISK_ALERT_PCT = envf("DISK_ALERT_PCT", 90)
@@ -142,24 +144,31 @@ def decide(now, hb, state):
     prev_key = state.get("key")
     prev_level = state.get("level")
 
+    # 这次故障里已经发过几封；换了故障类型（比如 offline → degraded）就重新计数
+    sent = int(state.get("alert_count") or 0)
+    if state.get("alert_key") != key:
+        sent = 0
+
     if prev_level is None:
         action = "none" if level == "ok" else "alert"
     elif key == prev_key:
         if level == "ok":
             action = "none"
-        elif now - int(state.get("notified") or 0) > cooldown_ms:
-            action = "repeat"
+        elif sent >= MAX_ALERTS:
+            action = "none"                      # 已达封顶，安静等恢复
+        elif now - int(state.get("notified") or 0) >= cooldown_ms:
+            action = "repeat"                    # 第二封（也是最后一封）
         else:
             action = "none"
     elif level == "ok":
-        action = "recover"
+        action = "recover"                       # 恢复：发一封，计数归零
     else:
-        action = "alert"          # 异常原因变了，立刻提醒
+        action = "alert" if sent < MAX_ALERTS else "none"
 
     return level, reason, key, action
 
 
-def compose(now, hb, state, level, reason, action):
+def compose(now, hb, state, level, reason, action, sent_count=0):
     host = (hb or {}).get("host") or "casaos"
     if level == "offline":
         subject = "[NAS 离线] %s 已%s没有心跳" % (host, fmt_dur(now - int(hb["ts"])))
@@ -211,6 +220,8 @@ def compose(now, hb, state, level, reason, action):
         lines.append("  3. NAS 连不上 api.github.com")
 
     lines.append("")
+    if sent_count >= MAX_ALERTS and action != "recover":
+        lines.append("本次故障已提醒 %d 封，达到上限，之后不再发信；恢复时会再通知一次。" % MAX_ALERTS)
     lines.append("-- 由 GitHub Actions 巡检生成，每 5 分钟一次")
     return subject, "\n".join(lines)
 
@@ -244,10 +255,17 @@ def main():
         state["born"] = now
 
     level, reason, key, action = decide(now, hb, state)
-    print("level=%s key=%s action=%s reason=%s" % (level, key, action, reason or "-"))
+
+    sent_before = int(state.get("alert_count") or 0)
+    if state.get("alert_key") != key:
+        sent_before = 0
+    sent_after = sent_before + (1 if action in ("alert", "repeat") else 0)
+
+    print("level=%s key=%s action=%s sent=%d/%d reason=%s"
+          % (level, key, action, sent_after, MAX_ALERTS, reason or "-"))
 
     if action != "none":
-        subject, body = compose(now, hb, state, level, reason, action)
+        subject, body = compose(now, hb, state, level, reason, action, sent_after)
         print("发信：%s" % subject)
         if DRY_RUN:
             print("--- 正文 ---")
@@ -270,6 +288,9 @@ def main():
         "since": since,
         "notified": now if action != "none" else int(state.get("notified") or 0),
         "checked": now,
+        # 本次故障已发几封 + 是哪种故障（换了类型重新计数）；恢复后归零
+        "alert_key": key,
+        "alert_count": sent_after if level != "ok" else 0,
     }
     if new_state != state:
         patch = {"files": {"state.json": {"content": json.dumps(new_state, ensure_ascii=False)}}}
