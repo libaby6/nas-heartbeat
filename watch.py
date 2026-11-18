@@ -10,6 +10,7 @@ import os
 import smtplib
 import ssl
 import time
+import urllib.error
 import urllib.request
 from email.message import EmailMessage
 from email.utils import formatdate
@@ -31,6 +32,10 @@ def envf(name, default):
 
 
 GIST_ID = envs("GIST_ID")
+# 巡检状态单独放一个 Gist：NAS 每 3 分钟写 hb.json，Actions 写 state.json，
+# 两个写者抢同一个 Gist 会偶发 HTTP 409 Conflict（实测约 2/10 次），状态写不回去
+# 就会丢封顶计数、导致重复发信。拆开后各写各的，再叠加 gh() 里的重试兜底。
+STATE_GIST_ID = envs("STATE_GIST_ID") or GIST_ID
 PAT = envs("GH_PAT")
 
 SMTP_HOST = envs("SMTP_HOST", "smtp.qq.com")
@@ -53,22 +58,46 @@ DRY_RUN = envs("DRY_RUN") == "1"
 
 # ---------------------------------------------------------------- 基础工具
 
-def gh(method, path, body=None):
+def gh(method, path, body=None, retries=4):
+    """调 GitHub API；409（并发写冲突）和 5xx 自动退避重试。
+
+    Gist 的 PATCH 是全量覆盖 + 版本校验，读完之后只要有人动过这个 Gist，
+    写就会被判 409。状态写失败会让封顶计数丢失，所以必须重试而不是直接抛。
+    """
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    req = urllib.request.Request(
-        API + path,
-        data=data,
-        method=method,
-        headers={
-            "Authorization": "Bearer " + PAT,
-            "Accept": "application/vnd.github+json",
-            "Content-Type": "application/json",
-            "User-Agent": "nas-heartbeat-watch",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=25) as resp:
-        raw = resp.read().decode("utf-8")
-    return json.loads(raw) if raw.strip() else {}
+    last = None
+    for attempt in range(retries):
+        req = urllib.request.Request(
+            API + path,
+            data=data,
+            method=method,
+            headers={
+                "Authorization": "Bearer " + PAT,
+                "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
+                "User-Agent": "nas-heartbeat-watch",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw.strip() else {}
+        except urllib.error.HTTPError as e:
+            last = e
+            if e.code in (409, 500, 502, 503, 504) and attempt < retries - 1:
+                wait = 1.5 * (attempt + 1)
+                print("  %s %s 返回 %d，%.1f 秒后重试（%d/%d）"
+                      % (method, path[:40], e.code, wait, attempt + 1, retries - 1))
+                time.sleep(wait)
+                continue
+            raise
+        except urllib.error.URLError as e:
+            last = e
+            if attempt < retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            raise
+    raise last
 
 
 def parse_json(text):
@@ -247,10 +276,17 @@ def send_mail(subject, body):
 def main():
     now = int(time.time() * 1000)
 
-    gist = gh("GET", "/gists/" + GIST_ID)
-    files = {k: (v.get("content") or "") for k, v in (gist.get("files") or {}).items()}
-    hb = parse_json(files.get("hb.json"))
-    state = parse_json(files.get("state.json")) or {}
+    hb_gist = gh("GET", "/gists/" + GIST_ID)
+    hb_files = {k: (v.get("content") or "") for k, v in (hb_gist.get("files") or {}).items()}
+    hb = parse_json(hb_files.get("hb.json"))
+
+    if STATE_GIST_ID == GIST_ID:
+        state = parse_json(hb_files.get("state.json")) or {}
+    else:
+        st_gist = gh("GET", "/gists/" + STATE_GIST_ID)
+        st_files = {k: (v.get("content") or "") for k, v in (st_gist.get("files") or {}).items()}
+        state = parse_json(st_files.get("state.json")) or {}
+
     if not state.get("born"):
         state["born"] = now
 
@@ -297,7 +333,7 @@ def main():
         if DRY_RUN:
             print("跳过写回（DRY_RUN）")
         else:
-            gh("PATCH", "/gists/" + GIST_ID, patch)
+            gh("PATCH", "/gists/" + STATE_GIST_ID, patch)
 
 
 if __name__ == "__main__":
